@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
-import 'package:flutter/widgets.dart' hide Category;
+import 'package:flutter/foundation.dart' show consolidateHttpClientResponseBytes;
+import 'package:flutter/widgets.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
@@ -13,6 +14,7 @@ import '../models/phrase.dart';
 import '../models/category.dart';
 import '../services/supabase_service.dart';
 import '../services/local_storage_service.dart';
+import '../services/memorize_audio_handler.dart';
 
 class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
   List<Playlist> _playlists = [];
@@ -50,20 +52,26 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     return _playlistPhrases[_phraseCounter!];
   }
 
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  final AudioPlayer _audioPlayer = AudioPlayer(
+    handleInterruptions: false,
+    maxSkipsOnError: 12,
+    androidAudioOffloadPreferences: const AndroidAudioOffloadPreferences(
+      audioOffloadMode: AndroidAudioOffloadMode.disabled,
+    ),
+  );
   StreamSubscription? _playerStateSubscription;
   StreamSubscription? _currentIndexSubscription;
   StreamSubscription? _playerErrorSubscription;
   StreamSubscription? _interruptionSubscription;
+  StreamSubscription? _becomingNoisySubscription;
+  Timer? _keepAliveTimer;
   bool _isPlaying = false;
   bool _isAutoplay = false;
+  bool _pausedForCall = false;
   int? _phraseCounter;
   bool _isRandom = false;
   bool _isSecondVoicePlaying = false;
   int _playToken = 0;
-  int _repeatCounter = 0;
-  int _firstRepeatCounter = 0;
-  int _secondRepeatCounter = 0;
   int _mediaSeq = 0;
   bool _isRefillingQueue = false;
   int? _nextPhraseToEnqueue;
@@ -71,9 +79,12 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
   String? _gapLongPath;
   final List<_QueuedClip> _queueClips = [];
   bool _restartingQueue = false;
+  bool _userPaused = false;
+  final Map<String, String> _voiceFileCache = {};
 
   bool get isPlaying => _isPlaying;
   bool get isAutoplay => _isAutoplay;
+  bool get isUserPaused => _userPaused;
   int? get phraseCounter => _phraseCounter;
   bool get isRandom => _isRandom;
   bool get isSecondVoicePlaying => _isSecondVoicePlaying;
@@ -82,6 +93,7 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     _isRandom = LocalStorageService.getSetting('isRandom', defaultValue: false) == true;
     WidgetsBinding.instance.addObserver(this);
     _initAudioPlayer();
+    _bindMediaControls();
     _loadLocalData();
     refreshData();
   }
@@ -89,14 +101,26 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.detached) return;
-    if (state == AppLifecycleState.inactive) {
-      _activateAudioSession();
-      return;
-    }
+    _resumeAutoplayIfNeeded();
+  }
+
+  void _resumeAutoplayIfNeeded() {
+    if (!_isAutoplay || _pausedForCall || _userPaused) return;
     _activateAudioSession();
-    if (_isAutoplay) {
+    if (!_audioPlayer.playing) {
       _audioPlayer.play();
     }
+  }
+
+  void _bindMediaControls() {
+    final handler = MemorizeAudioHandler.instance;
+    if (handler == null) return;
+    handler.attachPlayer(_audioPlayer);
+    handler.onPlay = resumeFromMedia;
+    handler.onPause = pauseFromMedia;
+    handler.onStop = stopPlaying;
+    handler.onSkipNext = skipToNextPhrase;
+    handler.onSkipPrevious = skipToPreviousPhrase;
   }
 
   Future<void> _activateAudioSession() async {
@@ -130,23 +154,46 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     try {
       final session = await AudioSession.instance;
       _interruptionSubscription = session.interruptionEventStream.listen((event) {
-        if (event.begin) return;
-        if (!_isAutoplay) return;
-        _activateAudioSession();
-        _audioPlayer.play();
+        if (event.begin) {
+          if (event.type == AudioInterruptionType.pause) {
+            _pausedForCall = true;
+            _audioPlayer.pause();
+          }
+          return;
+        }
+        if (event.type == AudioInterruptionType.pause) {
+          _pausedForCall = false;
+        }
+        _resumeAutoplayIfNeeded();
+      });
+      _becomingNoisySubscription = session.becomingNoisyEventStream.listen((_) {
+        pauseFromMedia();
       });
     } catch (e) {
       debugPrint('Audio interruption handler failed: $e');
     }
   }
 
+  void _startKeepAlive() {
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!_isAutoplay || _pausedForCall || _userPaused) return;
+      final state = _audioPlayer.processingState;
+      if (state == ProcessingState.completed || state == ProcessingState.idle) {
+        _handleAudioCompleted();
+      }
+    });
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _keepAliveTimer?.cancel();
     _playerStateSubscription?.cancel();
     _currentIndexSubscription?.cancel();
     _playerErrorSubscription?.cancel();
     _interruptionSubscription?.cancel();
+    _becomingNoisySubscription?.cancel();
     _audioPlayer.dispose();
     super.dispose();
   }
@@ -200,7 +247,6 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
       for (final p in _phrases) p.id: ids.contains(p.id),
     };
     _phraseCounter = _playlistPhrases.isNotEmpty ? 0 : null;
-    _syncRepeatCountersToCurrentPhrase();
   }
 
   Future<void> refreshData() async {
@@ -511,14 +557,6 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  void _syncRepeatCountersToCurrentPhrase() {
-    if (_phraseCounter == null || _playlistPhrases.isEmpty) return;
-    final current = _playlistPhrases[_phraseCounter!];
-    _repeatCounter = current.repeat > 0 ? current.repeat : 1;
-    _firstRepeatCounter = current.firstRepeat > 0 ? current.firstRepeat : 1;
-    _secondRepeatCounter = 1;
-  }
-
   void toggleRandom() {
     _isRandom = !_isRandom;
     LocalStorageService.saveSetting('isRandom', _isRandom);
@@ -526,11 +564,38 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   void togglePlay() {
-    if (_isAutoplay) {
+    if (_userPaused && _isAutoplay) {
+      resumeFromMedia();
+    } else if (_isAutoplay) {
       stopPlaying();
     } else {
       start();
     }
+  }
+
+  void pauseFromMedia() {
+    if (!_isAutoplay && !_audioPlayer.playing) return;
+    _userPaused = true;
+    _isPlaying = false;
+    _audioPlayer.pause();
+    notifyListeners();
+  }
+
+  void resumeFromMedia() {
+    if (_playlistPhrases.isEmpty) {
+      showNotice('insert your Phrases\nYour List is emply');
+      return;
+    }
+    if (_isAutoplay) {
+      _userPaused = false;
+      _pausedForCall = false;
+      _isPlaying = true;
+      _activateAudioSession();
+      _audioPlayer.play();
+      notifyListeners();
+      return;
+    }
+    start();
   }
 
   void start() {
@@ -540,18 +605,24 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
     _isAutoplay = true;
     _isPlaying = true;
+    _pausedForCall = false;
+    _userPaused = false;
     _playToken++;
     _phraseCounter ??= 0;
-    _syncRepeatCountersToCurrentPhrase();
+    _publishCurrentMediaItem();
     notifyListeners();
+    _startKeepAlive();
     _startAutoplayQueue(playMainOnlyFirst: false);
   }
 
   void stopPlaying() {
     _isAutoplay = false;
     _isPlaying = false;
+    _pausedForCall = false;
+    _userPaused = false;
     _isSecondVoicePlaying = false;
     _playToken++;
+    _keepAliveTimer?.cancel();
     _queueClips.clear();
     _nextPhraseToEnqueue = null;
     _audioPlayer.stop();
@@ -587,8 +658,9 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
       return;
     }
     _playToken++;
+    _userPaused = false;
     _phraseCounter = _nextPhraseIndex(_phraseCounter ?? 0);
-    _syncRepeatCountersToCurrentPhrase();
+    _publishCurrentMediaItem();
     notifyListeners();
     if (_isAutoplay) {
       _startAutoplayQueue(playMainOnlyFirst: playMain);
@@ -603,8 +675,9 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
       return;
     }
     _playToken++;
+    _userPaused = false;
     _phraseCounter = _previousPhraseIndex(_phraseCounter ?? 0);
-    _syncRepeatCountersToCurrentPhrase();
+    _publishCurrentMediaItem();
     notifyListeners();
     if (_isAutoplay) {
       _startAutoplayQueue(playMainOnlyFirst: playMain);
@@ -621,6 +694,10 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (currentToken != _playToken || !_isAutoplay) return;
 
     final startIndex = _phraseCounter ?? 0;
+    if (startIndex >= 0 && startIndex < _playlistPhrases.length) {
+      await _prefetchPhraseVoices(_playlistPhrases[startIndex]);
+    }
+    if (currentToken != _playToken || !_isAutoplay) return;
     final built = _buildAutoplayQueue(
       startPhraseIndex: startIndex,
       playMainOnlyFirst: playMainOnlyFirst,
@@ -641,6 +718,7 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
       await _audioPlayer.setAudioSources(built.sources, preload: true);
       if (currentToken != _playToken || !_isAutoplay) return;
       await _audioPlayer.play();
+      unawaited(_prefetchAround(_nextPhraseToEnqueue ?? startIndex));
     } catch (e) {
       debugPrint('Error starting autoplay queue: $e');
       showNotice('No Voice available');
@@ -650,7 +728,7 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
   _BuiltQueue _buildAutoplayQueue({
     required int startPhraseIndex,
     required bool playMainOnlyFirst,
-    int targetSources = 1200,
+    int targetSources = 32,
   }) {
     final sources = <AudioSource>[];
     final clips = <_QueuedClip>[];
@@ -773,16 +851,20 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   AudioSource _voiceSource(Phrase phrase, {required bool isSecond, required MediaItem tag}) {
     final key = isSecond ? phrase.voiceSecond : phrase.voice;
+    final cached = _voiceFileCache[key];
+    if (cached != null) {
+      return AudioSource.file(cached, tag: tag);
+    }
     return AudioSource.uri(Uri.parse(SupabaseService.getPublicUrl(key!)), tag: tag);
   }
 
   AudioSource _gapSource(MediaItem tag, {required bool long}) {
+    final duration = long ? const Duration(seconds: 3) : const Duration(milliseconds: 1700);
+    if (Platform.isAndroid) {
+      return SilenceAudioSource(duration: duration, tag: tag);
+    }
     final path = long ? _gapLongPath : _gapShortPath;
-    return ProgressiveAudioSource(
-      Uri.file(path!),
-      tag: tag,
-      duration: long ? const Duration(seconds: 3) : const Duration(milliseconds: 1700),
-    );
+    return AudioSource.file(path!, tag: tag);
   }
 
   MediaItem _mediaItemFor(Phrase phrase, {required bool isSecond}) {
@@ -791,7 +873,8 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
       id: '${phrase.id}_${isSecond ? 'v2' : 'v1'}_$_mediaSeq',
       title: phrase.phrase,
       album: _selectedPlaylist?.title ?? 'Memorize',
-      artist: isSecond ? 'Translated Voice' : 'Voice',
+      artist: _selectedPlaylist?.title ?? 'Memorize',
+      artUri: _artUriFor(phrase),
       playable: true,
     );
   }
@@ -813,22 +896,27 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (clip.isMissingVoice) {
       showNotice('No Voice available');
     }
-    if (changed) notifyListeners();
+    if (changed) {
+      _publishCurrentMediaItem(isSecond: clip.isSecondVoice);
+      notifyListeners();
+    }
   }
 
   Future<void> _maybeRefillQueue(int currentIndex) async {
     if (!_isAutoplay || _isRefillingQueue) return;
     final remaining = _queueClips.length - currentIndex;
-    if (remaining > 40) return;
+    if (remaining > 12) return;
     final nextIndex = _nextPhraseToEnqueue;
     if (nextIndex == null) return;
 
     _isRefillingQueue = true;
     try {
+      await _prefetchAround(nextIndex);
+      if (!_isAutoplay) return;
       final built = _buildAutoplayQueue(
         startPhraseIndex: nextIndex,
         playMainOnlyFirst: false,
-        targetSources: 400,
+        targetSources: 32,
       );
       if (!_isAutoplay || built.sources.isEmpty) return;
       _queueClips.addAll(built.clips);
@@ -888,12 +976,23 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
     if (_restartingQueue || _playlistPhrases.isEmpty) return;
     _restartingQueue = true;
-    final continueFrom = _nextPhraseToEnqueue ?? _nextPhraseIndex(_phraseCounter ?? 0);
-    _phraseCounter = continueFrom;
-    _syncRepeatCountersToCurrentPhrase();
-    _startAutoplayQueue(playMainOnlyFirst: false).whenComplete(() {
+    _continueAfterQueueEnded().whenComplete(() {
       _restartingQueue = false;
     });
+  }
+
+  Future<void> _continueAfterQueueEnded() async {
+    if (!_isAutoplay) return;
+    await _maybeRefillQueue(_audioPlayer.currentIndex ?? 0);
+    if (!_isAutoplay) return;
+    if (_audioPlayer.processingState != ProcessingState.completed &&
+        _audioPlayer.processingState != ProcessingState.idle) {
+      await _audioPlayer.play();
+      return;
+    }
+    final continueFrom = _nextPhraseToEnqueue ?? _nextPhraseIndex(_phraseCounter ?? 0);
+    _phraseCounter = continueFrom;
+    await _startAutoplayQueue(playMainOnlyFirst: false);
   }
 
   Future<void> playPhraseVoiceManually(Phrase phrase, {bool isSecond = false}) async {
@@ -919,15 +1018,126 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  void _publishCurrentMediaItem({bool isSecond = false}) {
+    final phrase = currentPhrase;
+    if (phrase == null) return;
+    MemorizeAudioHandler.instance?.setCurrentMediaItem(
+      MediaItem(
+        id: 'phrase_${phrase.id}',
+        title: phrase.phrase,
+        album: _selectedPlaylist?.title ?? 'Memorize',
+        artist: _selectedPlaylist?.title ?? 'Memorize',
+        artUri: _artUriFor(phrase),
+        playable: true,
+      ),
+    );
+  }
+
+  void skipToNextPhrase() {
+    _userPaused = false;
+    if (_isAutoplay && _seekToRelativePhrase(1)) {
+      _audioPlayer.play();
+      return;
+    }
+    goToNext(playMain: true);
+  }
+
+  void skipToPreviousPhrase() {
+    _userPaused = false;
+    if (_isAutoplay && _seekToRelativePhrase(-1)) {
+      _audioPlayer.play();
+      return;
+    }
+    goToPrevious(playMain: true);
+  }
+
+  bool _seekToRelativePhrase(int direction) {
+    final current = _audioPlayer.currentIndex;
+    if (current == null || current < 0 || current >= _queueClips.length) {
+      return false;
+    }
+    final currentPhraseIndex = _queueClips[current].phraseIndex;
+    if (direction > 0) {
+      for (var i = current + 1; i < _queueClips.length; i++) {
+        if (_queueClips[i].phraseIndex != currentPhraseIndex) {
+          _audioPlayer.seek(Duration.zero, index: i);
+          return true;
+        }
+      }
+      return false;
+    }
+    int? previousPhraseIndex;
+    for (var i = current - 1; i >= 0; i--) {
+      if (_queueClips[i].phraseIndex != currentPhraseIndex) {
+        previousPhraseIndex = _queueClips[i].phraseIndex;
+        break;
+      }
+    }
+    if (previousPhraseIndex == null) return false;
+    for (var i = 0; i <= current; i++) {
+      if (_queueClips[i].phraseIndex == previousPhraseIndex) {
+        _audioPlayer.seek(Duration.zero, index: i);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Uri? _artUriFor(Phrase phrase) {
+    if (phrase.picture != null && phrase.picture!.isNotEmpty) {
+      return Uri.parse(SupabaseService.getPublicUrl(phrase.picture));
+    }
+    final cover = _selectedPlaylist?.image;
+    if (cover != null && cover.isNotEmpty) {
+      return Uri.parse(SupabaseService.getPublicUrl(cover));
+    }
+    return null;
+  }
+
+  Future<void> _prefetchAround(int startIndex) async {
+    if (_playlistPhrases.isEmpty) return;
+    var index = startIndex;
+    for (var i = 0; i < 5; i++) {
+      if (index < 0 || index >= _playlistPhrases.length) break;
+      await _prefetchPhraseVoices(_playlistPhrases[index]);
+      index = _nextPhraseIndex(index);
+    }
+  }
+
+  Future<void> _prefetchPhraseVoices(Phrase phrase) async {
+    await _cacheVoiceKey(phrase.voice);
+    await _cacheVoiceKey(phrase.voiceSecond);
+  }
+
+  Future<void> _cacheVoiceKey(String? key) async {
+    if (key == null || key.isEmpty || _voiceFileCache.containsKey(key)) return;
+    try {
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/voice_${key.hashCode.toRadixString(16)}.m4a');
+      if (!await file.exists() || await file.length() == 0) {
+        final client = HttpClient();
+        try {
+          final request = await client.getUrl(Uri.parse(SupabaseService.getPublicUrl(key)));
+          final response = await request.close();
+          if (response.statusCode >= 400) return;
+          await file.writeAsBytes(await consolidateHttpClientResponseBytes(response), flush: true);
+        } finally {
+          client.close(force: true);
+        }
+      }
+      if (await file.exists() && await file.length() > 0) {
+        _voiceFileCache[key] = file.path;
+      }
+    } catch (e) {
+      debugPrint('Voice cache failed: $e');
+    }
+  }
+
   Future<void> _setAndPlay(Phrase phrase, {required bool isSecond}) async {
     final key = isSecond ? phrase.voiceSecond : phrase.voice;
     if (key == null || key.isEmpty) return;
-    final url = SupabaseService.getPublicUrl(key);
     await _audioPlayer.setAudioSources([
-      AudioSource.uri(
-        Uri.parse(url),
-        tag: _mediaItemFor(phrase, isSecond: isSecond),
-      ),
+      _voiceSource(phrase, isSecond: isSecond, tag: _mediaItemFor(phrase, isSecond: isSecond)),
     ]);
     await _audioPlayer.play();
   }
@@ -938,6 +1148,10 @@ class AppProvider extends ChangeNotifier with WidgetsBindingObserver {
       final status = await Permission.notification.status;
       if (!status.isGranted) {
         await Permission.notification.request();
+      }
+      final batteryStatus = await Permission.ignoreBatteryOptimizations.status;
+      if (!batteryStatus.isGranted) {
+        await Permission.ignoreBatteryOptimizations.request();
       }
     } catch (e) {
       debugPrint('Notification permission request failed: $e');

@@ -2,10 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 import 'providers/app_provider.dart';
 import 'services/local_storage_service.dart';
+import 'services/memorize_audio_handler.dart';
 import 'services/supabase_service.dart';
 import 'screens/player_screen.dart';
 import 'theme/app_colors.dart';
@@ -13,11 +14,16 @@ import 'theme/app_colors.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.example.memorize.audio',
-    androidNotificationChannelName: 'Memorize Playback',
-    androidNotificationOngoing: true,
-    androidStopForegroundOnPause: false,
+  await AudioService.init(
+    builder: () => MemorizeAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.example.memorize.audio',
+      androidNotificationChannelName: 'Memorize Playback',
+      androidNotificationChannelDescription: 'Phrase audio playback',
+      androidStopForegroundOnPause: false,
+      androidNotificationIcon: 'mipmap/ic_launcher',
+      notificationColor: Color(0xFF0B307B),
+    ),
   );
 
   final session = await AudioSession.instance;

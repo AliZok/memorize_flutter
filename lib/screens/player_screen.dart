@@ -187,7 +187,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   const SizedBox(height: 8),
                   _SideButton(
                     icon: Icons.play_arrow,
-                    playing: provider.isAutoplay,
+                    playing: provider.isAutoplay && !provider.isUserPaused,
                     onTap: provider.togglePlay,
                   ),
                 ],
